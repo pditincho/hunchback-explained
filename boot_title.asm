@@ -11,42 +11,54 @@
 ; the instructions page, and the joystick/keyboard choice that ends in a new
 ; game.
 ;
+; The front end is an attract loop with asynchronous exits through CINV:
+;   initialize_game -> show_title_sequence (logo, then high scores) -> run_attract_intro
+;   run_attract_intro -> intro_walk_right / intro title animation -> flash_title_lettering
+;   flash_title_lettering -> wait_before_attract_restart -> restart_attract_mode -> show_title_sequence
+; While handle_title_keys_irq is installed, F1 abandons the interrupted sequence for
+; show_instructions -> wait_before_attract_restart; SPACE abandons it for select_controls
+; -> start_new_game -> set_lives_start. Both exits reset SP instead of returning
+; through the interrupted IRQ. intro_begin temporarily uses the intro IRQs;
+; run_attract_intro reinstalls the title-key handler after that cinematic returns.
+;
 ; clear_screen and restore_kernal_irq are small helpers other code can reuse.
+; Delay durations below are approximate busy-loop timings, not frame counts;
+; IRQ work and the machine clock affect the elapsed time.
 ;
 ;
 ; Routines:
 ;
-;   start                    Entry point: set up the video chip and the high-score table, then show the title screen.
+;   initialize_game                         Entry point: set up the video chip and the high-score table, then show the title screen.
 ;
-;   clear_screen             Clear the screen and show the two prompt lines at the bottom.
+;   clear_screen                            Clear the screen and show the two prompt lines at the bottom.
 ;
-;   title_screen             Title screen: logo with color cycling, then the high-score page and the intro run.
+;   show_title_sequence                     Title screen: logo with color cycling, then the high-score page and the intro run.
 ;
-;   draw_hiscores            Draw the high-score page: heading, column headers, five entries and the color bands.
+;   draw_high_scores                        Draw the high-score page: heading, column headers, five entries and the color bands.
 ;
-;   color_cycle_x            Cycle the current title-picture color, wrapping at yellow.
+;   get_title_color_for_increment           Cycle the current title-picture color, wrapping at yellow.
 ;
-;   attract_intro            Run the intro demo with the title keys active.
+;   run_attract_intro                       Run the intro demo with the title keys active.
 ;
-;   irq_title_keys           IRQ handler of the title screen: F1 shows the instructions, SPACE starts the game.
+;   handle_title_keys_irq                   IRQ handler of the title screen: F1 shows the instructions, SPACE starts the game.
 ;
-;   title_start_game         leave the attract mode and go to the control selection.
+;   exit_attract_mode_to_control_selection  Leave the attract mode and go to the control selection.
 ;
-;   restore_kernal_irq       Restore the IRQ vector back to the normal KERNAL interrupt routine.
+;   restore_kernal_irq                      Restore the IRQ vector back to the normal KERNAL interrupt routine.
 ;
-;   show_instructions        Show the instructions page for about 10 seconds.
+;   show_instructions                       Show the instructions page for about 10 seconds.
 ;
-;   attract_delay            Wait about 10 seconds, then restart the attract mode.
+;   wait_before_attract_restart             Wait about 10 seconds, then restart the attract mode.
 ;
-;   sprites_off_restore_irq  Switch all sprites off and restore the KERNAL IRQ.
+;   disable_sprites_and_restore_kernal_irq  Switch all sprites off and restore the KERNAL IRQ.
 ;
-;   flash_prompt             Flash the title lettering of the intro for about 5 seconds.
+;   flash_title_lettering                   Flash the title lettering of the intro for about 5 seconds.
 ;
-;   attract_restart          Switch the sprites off and return to the title screen.
+;   restart_attract_mode                    Switch the sprites off and return to the title screen.
 ;
-;   select_controls          Ask for the control method (joystick or keyboard) and show the matching help.
+;   select_controls                         Ask for the control method (joystick or keyboard) and show the matching help.
 ;
-;   game_start               Start a new game: wait, run the intro demo, reset the game variables.
+;   start_new_game                          Start a new game: wait, run the intro demo, reset the game variables.
 ;=============================================================================
 ;
 ; ---------------------------------------------------------------------------
@@ -73,7 +85,7 @@ TITLE_TEXT_LEN    = 14                        ; characters of each of the three 
 TITLE_OCEAN       = 1*SCREEN_COLS+13          ; screen offset of "OCEAN SOFTWARE": row 1, column 13
 TITLE_PRESENTS    = 3*SCREEN_COLS+13          ; screen offset of "PRESENTS": row 3, column 13
 TITLE_AUTHOR      = 21*SCREEN_COLS+25         ; screen offset of "BY J.STEELE": row 21, column 25
-color_MASK       = 7                         ; the picture cycles through colors 1-7 (black is skipped)
+COLOR_MASK        = 7                         ; the picture cycles through colors 1-7 (black is skipped)
 TITLE_CYCLE_PASSES= 17                        ; color steps of the picture, about 0.33 s each
 TITLE_HOLD_PASSES = 16                        ; delay passes of about 0.33 s before the high-score page
 BONUS_TEXT        = 16*SCREEN_COLS+11         ; screen offset of "BONUS MAN AT 10000": row 16, column 11
@@ -97,7 +109,7 @@ HS_BAND_ROW       = 3                         ; first row of the color bands
 HS_BANDS          = 6                         ; color bands: the heading rows and the five entries
 
 ; ---- Title picture color cycle
-TITLE_PIC_color  = COLORRAM+5*SCREEN_COLS+5  ; color RAM cell of the first character of the title picture
+TITLE_PIC_COLOR   = COLORRAM+5*SCREEN_COLS+5  ; color RAM cell of the first character of the title picture
 COL_YELLOW        = 7                         ; VIC color 7: the last color of the cycle (the cycle skips black, color 0)
 
 ; ---- Title keys
@@ -141,30 +153,41 @@ GAME_VARS         = 12                        ; bytes from clear_block to extra_
 ; Variables
 ; ---------------------------------------------------------------------------
 
-; ---- game variables - apparently unused
-unused_0342 = $0342  
-unused_0343 = $0343  
-unused_0344 = $0344  
-clear_block = $0345  
+; ---- Initialization-only locations
+; No explicit reads of $0342-$0344 occur in the supplied game source.
+; This is a static-reference finding, not proof against indirect access.
+unused_0342 = $0342
+unused_0343 = $0343
+unused_0344 = $0344
+
+; ---- Contiguous new-game reset block (12 bytes, $0345-$0350 inclusive)
+; $0345        unnamed byte
+; $0346        facing
+; $0347        unnamed byte
+; $0348        bells
+; $0349-$034F  score[0..6]
+; $0350        extra_life_given
+; lives ($0351) is outside this block and is set by set_lives_start.
+clear_block = $0345
 
 ;=============================================================================
-; start
+; initialize_game
 ;=============================================================================
 ;
 ; Game entry: sets up video chip and the high-score table, then shows the title screen.
 ;
-; - Locks out the character-set switch of the Commodore and Shift keys. 
+; - Locks out the character-set switch of the Commodore and Shift keys.
 ; - Sets up VIC chip to use bank 1
 ; - Sets up the video mode and colors
 ; - Sets up the initial high score table
 ;
 ; Inputs  : tbl_hs_defaults
 ;
-; Returns : none - jumps to title_screen
+; Changes : video/CIA setup, sprite multicolors, HISCORE
 ;
 ;=============================================================================
         .segment "S_4000"
-start:
+initialize_game:
         ;---------------------------------------------------------------------
         ; Lock the character set: CHROUT code 8 disables the Commodore/Shift case switch
         ;---------------------------------------------------------------------
@@ -180,8 +203,8 @@ start:
         sta  CIA2_PRA
 
         ;---------------------------------------------------------------------
-        ; Set screen and character set addresses, multicolor text mode, 
-		; black border and background, dark grey for multicolor 1
+        ; Set screen and character set addresses, multicolor text mode,
+        ; black border and background, dark grey for multicolor 1
         ;---------------------------------------------------------------------
         lda  #VIC_MEMPTR_VALUE
         sta  VIC_MEMPTR
@@ -208,7 +231,7 @@ copy_hs_defaults:
         sta  HISCORE,x
         dex
         bpl  copy_hs_defaults
-        jmp  title_screen
+        jmp  show_title_sequence
 
 ;=============================================================================
 ; clear_screen
@@ -216,8 +239,10 @@ copy_hs_defaults:
 ;
 ; Clears the screen and shows the two prompt lines at the bottom.
 ;
-; - Sets all screen characters to spaces and the color RAM to white. 
+; - Sets all screen characters to spaces and the color RAM to white.
 ; - Prints message at rows 23 and 24: "PRESS F1 FOR INSTRUCTIONS" and "OR SPACE TO START"
+;
+; Changes : SCREEN, COLORRAM
 ;
 ;=============================================================================
         .segment "S_4039"
@@ -240,9 +265,6 @@ clear_screen_loop:
         inx
         bne  clear_screen_loop
 
-        ;---------------------------------------------------------------------
-        ; Print the two prompt lines at the bottom
-        ;---------------------------------------------------------------------
         ldx  #PROMPT_LEN-1
 prompt_text_loop:
         lda  txt_press_f1,x
@@ -254,37 +276,42 @@ prompt_text_loop:
         rts
 
 ;=============================================================================
-; title_screen
+; show_title_sequence
 ;=============================================================================
 ;
 ; Show logo with color cycling, then the high-score page and then switches to demo mode.
 ;
 ; - Turn off sound and clear the screen
 ; - Hook the title-key IRQ handler so that F1 and SPACE keys work
-; - Copies the title logo to screen 
+; - Copies the title logo to screen
 ; - Prints the "Ocean software presents..." message
 ; - Cycles the logo colors for about 5 seconds
 ; - Shows the high-score table
 ; - Switches to the demo/attract mode
+;
+; Changes : display, SID/music state, CINV
+;
 ;=============================================================================
         .segment "S_406C"
-title_screen:
+show_title_sequence:
         ;---------------------------------------------------------------------
         ; Silence the sound, clear the screen (with the prompt lines) and hook the title-key IRQ
         ;---------------------------------------------------------------------
         jsr  volume_off_clear_screen
         sei
-        lda  #<irq_title_keys
+        lda  #<handle_title_keys_irq
         sta  CINV
-        lda  #>irq_title_keys
+        lda  #>handle_title_keys_irq
         sta  CINV+1
         cli
 
         ;---------------------------------------------------------------------
-        ; The title logo: 590 characters in three overlapping 256-byte blocks
+        ; Cover all 590 logo cells with blocks at offsets 0, 256 and 334.
+        ; The last two overlap by 178 bytes; repeated writes use the same data.
+        ; X visits 0, $FF..$01: DEX/BNE from zero executes 256 iterations.
         ;---------------------------------------------------------------------
         ldx  #$00
-picture_copy_loop:
+copy_title_picture_loop:
         lda  data_title_picture,x
         sta  SCREEN+TITLE_PIC,x
         lda  data_title_picture+PAGE,x
@@ -292,7 +319,7 @@ picture_copy_loop:
         lda  data_title_picture+TITLE_PIC_SIZE-PAGE,x
         sta  SCREEN+TITLE_PIC+TITLE_PIC_SIZE-PAGE,x
         dex
-        bne  picture_copy_loop
+        bne  copy_title_picture_loop
 
         ;---------------------------------------------------------------------
         ; Print "OCEAN SOFTWARE", "PRESENTS" and the author line; the first and the last in green
@@ -317,10 +344,10 @@ title_text_loop:
         lda  #TITLE_CYCLE_PASSES
         sta  cnt
 color_cycle_pass:
-        jsr  color_cycle_x         ; X = current picture color (0 if it was 7)
-        inx                         ; next color
+        jsr  get_title_color_for_increment         ; X = current picture color (0 if it was 7)
+        inx                         ; helper maps 7 to 0, so this skips black
         txa
-        and  #color_MASK
+        and  #COLOR_MASK
         ldx  #$00
 picture_color_loop:
         sta  COLORRAM+TITLE_PIC+TITLE_PIC_SIZE-PAGE,x
@@ -330,6 +357,8 @@ picture_color_loop:
         bne  picture_color_loop
         ldx  #$00
 cycle_delay_mid:
+        ; Zero-initialized DEY/BNE and DEX/BNE each run 256 iterations.
+        ; Together these form 65,536 inner iterations per delay pass.
         ldy  #$00
 cycle_delay_inner:
         dey
@@ -360,7 +389,7 @@ hold_delay_inner:
         ; Show the high-score page: the table and "BONUS MAN AT 10000" in red
         ;---------------------------------------------------------------------
         jsr  clear_screen
-        jsr  draw_hiscores
+        jsr  draw_high_scores
         ldx  #BONUS_TEXT_LEN-1
 bonus_text_loop:
         lda  txt_bonus_man,x
@@ -369,23 +398,27 @@ bonus_text_loop:
         sta  COLORRAM+BONUS_TEXT,x
         dex
         bpl  bonus_text_loop
-        jmp  attract_intro
+        jmp  run_attract_intro
 
 ;=============================================================================
-; draw_hiscores
+; draw_high_scores
 ;=============================================================================
 ;
 ; Draw the high-score page: heading, column headers, five entries and the color bands.
 ;
 ; The page has the heading "HISCORE" with the best score under it.
 ; Then the headers "LEAGUE ORDER", "SCORE" and "NAME.".
-; Then five entries, two screen rows apart. 
-; Each entry shows "NO." and its rank digit, the 7 score digits and the 3 initials from HISCORE. 
+; Then five entries, two screen rows apart.
+; Each entry shows "NO." and its rank digit, the 7 score digits and the 3 initials from HISCORE.
 ;
 ; The color RAM is filled in six bands of two rows (rows 3 to 14), one color of tbl_hs_row_cols for each, the last color first.
+;
+; Inputs  : HISCORE, high-score text/color tables.
+; Changes : SCREEN, COLORRAM
+;
 ;=============================================================================
         .segment "S_4103"
-draw_hiscores:
+draw_high_scores:
         ;---------------------------------------------------------------------
         ; Print texts of the table: heading, best score, column heads, and the 7 score digits of every entry
         ;---------------------------------------------------------------------
@@ -441,7 +474,9 @@ hs_rank_loop:
         bpl  hs_rank_loop
 
         ;---------------------------------------------------------------------
-        ; Set up color bands of two rows each: the colors of tbl_hs_row_cols, last one first
+        ; cnt/cnt2 form the little-endian ZP destination pointer for (cnt),Y.
+        ; Fill 80-byte bands using tbl_hs_row_cols[5..0], advancing the pointer
+        ; with carry into cnt2 so a band may cross a page boundary.
         ;---------------------------------------------------------------------
         lda  #<(COLORRAM+HS_BAND_ROW*SCREEN_COLS)
         sta  cnt
@@ -451,10 +486,10 @@ hs_rank_loop:
 hs_band_loop:
         ldy  #HS_ROW_STEP-1
         lda  tbl_hs_row_cols,x
-hs_band_fill:
+fill_high_score_color_band:
         sta  (cnt),y
         dey
-        bpl  hs_band_fill
+        bpl  fill_high_score_color_band
         lda  cnt
         clc
         adc  #HS_ROW_STEP
@@ -481,28 +516,27 @@ hs_band_next:
         rts
 
 ;=============================================================================
-; color_cycle_x
+; get_title_color_for_increment
 ;=============================================================================
 ;
 ; Cycle the logo color
 ;
-; The title screen cycles the color of the whole picture (title_screen, 17 steps).
+; The title screen cycles the color of the whole picture (show_title_sequence, 17 steps).
 ;
-; - The picture's color is read from its first character cell. 
-; - The caller adds 1 to X and masks it with 7, then writes that as the new color. 
-; - This routine turns a color of 7 into 0, so 7 becomes 1 after the caller's INX. 
+; - The picture's color is read from its first character cell.
+; - The caller adds 1 to X and masks it with 7, then writes that as the new color.
+; - This routine turns a color of 7 into 0, so 7 becomes 1 after the caller's INX.
 ; - The cycle is 1, 2, ... 7, 1, ... and never uses black (color 0), which would be
-; invisible on the black background. 
+; invisible on the black background.
 ;
 ; Returns : X = current color, or 0 if it was 7
 ;
+; Inputs  : first title-picture color RAM cell.
+;
 ;=============================================================================
         .segment "S_44A7"
-color_cycle_x:
-        ;---------------------------------------------------------------------
-        ; Fetch the current picture color
-        ;---------------------------------------------------------------------
-        ldx  TITLE_PIC_color       ; X = current color of the picture
+get_title_color_for_increment:
+        ldx  TITLE_PIC_COLOR
 
         ;---------------------------------------------------------------------
         ; Wrap: yellow (7) becomes 0 so that the caller's INX gives color 1 (black is skipped)
@@ -511,61 +545,62 @@ color_cycle_x:
         bne  color_cycle_done
         ldx  #$00                   ; yes: return 0 instead, so the caller's INX gives 1
 color_cycle_done:
-        rts                         ; return
+        rts
 
 ;=============================================================================
-; attract_intro
+; run_attract_intro
 ;=============================================================================
 ;
 ; Run the attract intro.
 ;
 ; intro_begin draws the tower screen and plays the demo.
-; When it finishes, irq_title_keys is hooked again (so F1 and SPACE work).
+; When it finishes, handle_title_keys_irq is hooked again (so F1 and SPACE work).
 ; intro_walk_right continues with the hero on the wall.
+;
+; Changes : intro state/display via intro_begin
 ;
 ;=============================================================================
         .segment "S_4695"
-attract_intro:
+run_attract_intro:
         ;---------------------------------------------------------------------
         ; Intro run for the attract mode; then the title keys work again
         ;---------------------------------------------------------------------
         jsr  intro_begin
         sei
-        lda  #<irq_title_keys
+        lda  #<handle_title_keys_irq
         sta  CINV
-        lda  #>irq_title_keys
+        lda  #>handle_title_keys_irq
         sta  CINV+1
         cli
         jmp  intro_walk_right
 
 ;=============================================================================
-; irq_title_keys
+; handle_title_keys_irq
 ;=============================================================================
 ;
 ; IRQ handler of the title screen: F1 shows the instructions, SPACE starts the game.
 ;
-; Reads the code of the key that is pressed from the KERNAL (ZP_CURKEY): 
-; 	- F1 goes to show_instructions
-; 	- SPACE to title_start_game
-; 	- anything else to the normal KERNAL IRQ routine
+; Reads the code of the key that is pressed from the KERNAL (ZP_CURKEY):
+;   - F1 goes to show_instructions
+;   - SPACE to exit_attract_mode_to_control_selection
+;   - anything else to the normal KERNAL IRQ routine
 ;
 ; Inputs  : ZP_CURKEY
 ;
+; Entry   : KERNAL dispatch through CINV, with its IRQ context on the stack.
+;
 ;=============================================================================
         .segment "S_46AD"
-irq_title_keys:
-        ;---------------------------------------------------------------------
-        ; F1: instructions; SPACE: start; anything else: the normal IRQ
-        ;---------------------------------------------------------------------
+handle_title_keys_irq:
         lda  ZP_CURKEY
         cmp  #KEY_F1
         beq  show_instructions
         cmp  #KEY_SPACE
-        beq  title_start_game
+        beq  exit_attract_mode_to_control_selection
         jmp  KERNAL_IRQ             ; no title key: normal IRQ
 
 ;=============================================================================
-; title_start_game
+; exit_attract_mode_to_control_selection
 ;=============================================================================
 ;
 ; Leave the attract mode and go to the control selection.
@@ -573,12 +608,14 @@ irq_title_keys:
 ; Switches the sprites off and restores the KERNAL IRQ. The stack pointer is reset, because this
 ; code is entered from the IRQ handler and never returns to what was running.
 ;
+; Changes : VIC_SPR_EN
+;
 ;=============================================================================
-title_start_game:
+exit_attract_mode_to_control_selection:
         ;---------------------------------------------------------------------
         ; Sprites off, normal IRQ, drop the interrupted context
         ;---------------------------------------------------------------------
-        jsr  sprites_off_restore_irq
+        jsr  disable_sprites_and_restore_kernal_irq
         ldx  #STACK_RESET
         txs
         jmp  select_controls
@@ -590,17 +627,20 @@ title_start_game:
 ; Sets the IRQ vector back to the normal KERNAL interrupt routine.
 ;
 ; The game hooks the vector at CINV ($0314/$0315) with its own IRQ handlers (music,
-; intro runner, hazards, title keys, scrolling). 
-; This routine undoes that by writing KERNAL_IRQ ($EA31) back. 
+; intro runner, hazards, title keys, scrolling).
+; This routine undoes that by writing KERNAL_IRQ ($EA31) back.
 ;
 ; Interrupts are disabled while the two bytes are written so that an IRQ cannot see a half-changed vector.
+;
+; Changes : CINV
+; Exit    : RTS with interrupts enabled (CLI)
 ;
 ;=============================================================================
 restore_kernal_irq:
         ;---------------------------------------------------------------------
         ; Point the IRQ vector at the KERNAL routine, with interrupts disabled during the change
         ;---------------------------------------------------------------------
-        sei                         ; no interrupt while the vector is changed
+        sei
         lda  #<KERNAL_IRQ
         sta  CINV
         lda  #>KERNAL_IRQ
@@ -618,15 +658,18 @@ restore_kernal_irq:
 ; - Then six instruction lines (26 characters each) are written
 ; - Two bell pictures are displayed
 ; - The line "JOYSTICK OR KEYBOARD CONTROLS HERO" is printed
-; - irq_title_keys is hooked again, so SPACE can start the game
-; - If Space is not pressed, the routine goes on to attract_delay and the attract mode starts again
+; - handle_title_keys_irq is hooked again, so SPACE can start the game
+; - If Space is not pressed, the routine goes on to wait_before_attract_restart and the attract mode starts again
+;
+; Entry   : branch from handle_title_keys_irq on F1.
+; Changes : SCREEN, COLORRAM, VIC_SPR_EN, CINV
 ;
 ;=============================================================================
 show_instructions:
         ;---------------------------------------------------------------------
         ; Sprites off, normal IRQ, drop the interrupted context, clear the screen, wait until the key is released
         ;---------------------------------------------------------------------
-        jsr  sprites_off_restore_irq
+        jsr  disable_sprites_and_restore_kernal_irq
         ldx  #STACK_RESET
         txs
         jsr  clear_screen
@@ -680,23 +723,21 @@ ctrl_prompt_loop:
         dex
         bpl  ctrl_prompt_loop
         sei
-        lda  #<irq_title_keys
+        lda  #<handle_title_keys_irq
         sta  CINV
-        lda  #>irq_title_keys
+        lda  #>handle_title_keys_irq
         sta  CINV+1
         cli
+		;Fall through to wait_before_attract_restart
 
 ;=============================================================================
-; attract_delay
+; wait_before_attract_restart
 ;=============================================================================
 ;
 ; Wait about 10 seconds, then restart the attract mode.
 ;
 ;=============================================================================
-attract_delay:
-        ;---------------------------------------------------------------------
-        ; Wait about 10 s
-        ;---------------------------------------------------------------------
+wait_before_attract_restart:
         lda  #ATTRACT_PASSES
         sta  cnt
 attract_delay_outer:
@@ -710,43 +751,41 @@ attract_delay_inner:
         bne  attract_delay_mid
         dec  cnt
         bne  attract_delay_outer
-        jmp  attract_restart
+        jmp  restart_attract_mode
 
 ;=============================================================================
-; sprites_off_restore_irq
+; disable_sprites_and_restore_kernal_irq
 ;=============================================================================
 ;
 ; Switch all sprites off and restore the KERNAL IRQ.
 ;
+; Changes : VIC_SPR_EN
+;
 ;=============================================================================
         .segment "S_474D"
-sprites_off_restore_irq:
-        ;---------------------------------------------------------------------
-        ; Sprites off, then give the IRQ back to the KERNAL
-        ;---------------------------------------------------------------------
+disable_sprites_and_restore_kernal_irq:
         lda  #$00
         sta  VIC_SPR_EN
         jmp  restore_kernal_irq
 
 ;=============================================================================
-; flash_prompt
+; flash_title_lettering
 ;=============================================================================
 ;
 ; Flash the title lettering of the intro for about 5 seconds.
 ;
-; Two rows of 18 cells have bit 2 of their color toggled 64 times
-; (so the color changes between light blue and light red). 
-; Then the routine continues to attract_delay.
+; Each step samples the first letter cell, toggles color bit 2, then applies
+; that one result to all 36 cells (two rows of 18). Individual cell colors
+; are not toggled independently. The initialized light-blue color alternates
+; with light red for 64 steps.
+; Then the routine continues to wait_before_attract_restart.
 ;
 ;=============================================================================
         .segment "S_4755"
-flash_prompt:
-        ;---------------------------------------------------------------------
-		; Set up delay loop count
-        ;---------------------------------------------------------------------
+flash_title_lettering:
         lda  #LETTER_FLASH_STEPS
         sta  cnt
-		
+
         ;---------------------------------------------------------------------
         ; Toggle the color of the lettering
         ;---------------------------------------------------------------------
@@ -754,20 +793,20 @@ letter_flash_step:
         lda  COLORRAM+TITLE_LETTERS
         eor  #LETTER_FLASH_BIT
         ldx  #TITLE_LETTERS_LEN-1
-		
+
         ;---------------------------------------------------------------------
-        ; Continue with next cell
+        ; Apply the sampled color uniformly to both rows
         ;---------------------------------------------------------------------
 letter_flash_cells:
         sta  COLORRAM+TITLE_LETTERS,x
         sta  COLORRAM+TITLE_LETTERS+SCREEN_COLS,x
         dex
         bpl  letter_flash_cells
-        
+
         ;---------------------------------------------------------------------
         ; Delay a little bit
         ;---------------------------------------------------------------------
-		ldx  #LETTER_FLASH_DELAY
+        ldx  #LETTER_FLASH_DELAY
 letter_flash_delay_mid:
         ldy  #$00
 letter_flash_delay_inner:
@@ -777,10 +816,10 @@ letter_flash_delay_inner:
         bne  letter_flash_delay_mid
         dec  cnt
         bne  letter_flash_step
-        jmp  attract_delay
+        jmp  wait_before_attract_restart
 
 ;=============================================================================
-; attract_restart
+; restart_attract_mode
 ;=============================================================================
 ;
 ; Switch the sprites off and return to the title screen.
@@ -789,13 +828,10 @@ letter_flash_delay_inner:
 ;
 ;=============================================================================
         .segment "S_477A"
-attract_restart:
-        ;---------------------------------------------------------------------
-        ; Sprites off, back to the title screen
-        ;---------------------------------------------------------------------
+restart_attract_mode:
         lda  #$00
         sta  VIC_SPR_EN
-        jmp  title_screen
+        jmp  show_title_sequence
 
 ;=============================================================================
 ; select_controls
@@ -803,13 +839,16 @@ attract_restart:
 ;
 ; Asks for the control method (joystick or keyboard) and shows the matching help.
 ;
-; - The screen is cleared and "SELECT KEYBOARD OR JOYSTICK" is shown on four rows. 
-; - GETIN is polled until J or K is pressed. 
-; - control_mode becomes 0 for J (joystick) and 1 for K (keyboard). 
+; - The screen is cleared and "SELECT KEYBOARD OR JOYSTICK" is shown on four rows.
+; - GETIN is polled until J or K is pressed.
+; - control_mode becomes 0 for J (joystick) and 1 for K (keyboard).
 ; - For the joystick, the line "PLACE JOYSTICK IN PORT 2" is shown
-; - For the keyboard, "KEYBOARD CONTROLS" and the three key help lines for 
-; 	jump, move left and move right are printed. 
-; - Continues at game_start.
+; - For the keyboard, "KEYBOARD CONTROLS" and the three key help lines for
+;   jump, move left and move right are printed.
+; - Continues at start_new_game.
+;
+; Inputs  : KERNAL GETIN key buffer.
+; Changes : SCREEN, COLORRAM, control_mode
 ;
 ;=============================================================================
         .segment "S_4782"
@@ -847,17 +886,17 @@ select_text_loop:
         sta  SCREEN+10*SCREEN_COLS+SELECT_COL,x
         dex
         bpl  select_text_loop
-		
+
 wait_choice:
         ;---------------------------------------------------------------------
         ; Wait for J (joystick) or K (keyboard)
         ;---------------------------------------------------------------------
         jsr  GETIN
         cmp  #KEY_J
-        beq  choice_made
+        beq  store_control_choice
         cmp  #KEY_K
         bne  wait_choice
-choice_made:
+store_control_choice:
         ;---------------------------------------------------------------------
         ; Remember the choice: 0 = joystick, 1 = keyboard
         ;---------------------------------------------------------------------
@@ -865,7 +904,7 @@ choice_made:
         sbc  #KEY_J
         sta  control_mode         ; 0 = joystick, 1 = keyboard
         cmp  #CONTROL_KEYBOARD
-        beq  keyboard_help          ; keyboard: show the key help
+        beq  show_keyboard_help          ; keyboard: show the key help
 
         ;---------------------------------------------------------------------
         ; Joystick: its text, then the game starts
@@ -876,9 +915,9 @@ joystick_text_loop:
         sta  SCREEN+PLACE_JOY_POS,x
         dex
         bpl  joystick_text_loop
-        jmp  game_start
-		
-keyboard_help:
+        jmp  start_new_game
+
+show_keyboard_help:
         ;---------------------------------------------------------------------
         ; Keyboard: the key help, then the game starts
         ;---------------------------------------------------------------------
@@ -894,22 +933,25 @@ keyboard_text_loop:
         sta  SCREEN+22*SCREEN_COLS+KBD_HELP_COL,x
         dex
         bpl  keyboard_text_loop
-		; Fall through to game_start
+        ; Fall through to start_new_game
 
 ;=============================================================================
-; game_start
+; start_new_game
 ;=============================================================================
 ;
 ; Start a new game: wait, run the intro demo, reset the game variables.
 ;
-; After a pause of about 7 seconds, the SID volume is set to 15 and play_intro runs the intro cinematic. 
+; After a pause of about 7 seconds, the SID volume is set to 15 and play_intro runs the intro cinematic.
 ; Then screen 0 is selected, game state vars are reset/initialized and the sprites
-; are switched off. 
+; are switched off.
 ;
 ; lives is set by set_lives_start, which is where the routine ends.
 ;
+; Changes : intro state, screen, jump, player_x/player_x_hi,
+;           $0342-$0350, VIC_SPR_EN, A, X, Y (including callees).
+;
 ;=============================================================================
-game_start:
+start_new_game:
         ;---------------------------------------------------------------------
         ; Pause of about 7 s, then the SID volume to maximum
         ;---------------------------------------------------------------------
@@ -932,7 +974,7 @@ start_pause_inner:
         ;---------------------------------------------------------------------
         ; Intro cinematic
         ;---------------------------------------------------------------------
-        jsr  play_intro             ; the cinematic returns when the hero has climbed the wall
+        jsr  play_intro             
 
         ;---------------------------------------------------------------------
         ; New game: screen 0, no jump, hero at the left edge, score and bells cleared
@@ -941,20 +983,22 @@ start_pause_inner:
         sta  screen
         sta  jump
         sta  player_x_hi
+        ; Bulk-zero $0345-$0350: includes unnamed $0345/$0347, facing,
+        ; bells, seven score digits and extra_life_given; excludes lives.
         ldx  #GAME_VARS-1
-clear_vars_loop:
+clear_game_state_loop:
         sta  clear_block,x
         dex
-        bpl  clear_vars_loop		
+        bpl  clear_game_state_loop
         lda  #HERO_START_X
         sta  player_x
-		
-		; Unused vars
-        sta  unused_0344            ; never read by the game
+
+        ; Unused vars
+        sta  unused_0344
         lda  #$01
-        sta  unused_0342            ; never read by the game
+        sta  unused_0342
         lda  #$80
-        sta  unused_0343            ; never read by the game
+        sta  unused_0343
 
         ;---------------------------------------------------------------------
         ; No sprites for now; set the lives and start the first screen
@@ -967,8 +1011,7 @@ clear_vars_loop:
 ;=====================================================================
 ; PSEUDO-CODE
 ;=====================================================================
-; ---- start
-; start()   // game entry
+; ---- initialize_game
 ;     lock_charset_switch()
 ;     init_video(BANK=1, SCREEN=screen_base, CHARSET=charset_base, MODE=multicolor_text)
 ;     set_border_color(BLACK)
@@ -977,40 +1020,37 @@ clear_vars_loop:
 ;     set_multicolor_2(WHITE)
 ;     set_sprite_multicolors(WHITE)
 ;     hiscore_table[0..49] = default_hiscore_table[0..49]
-;     goto title_screen
+;     goto show_title_sequence
+;
+;
+; ---- show_title_sequence
+;     sound_off()
+;     clear_screen()
+;     set_key_handler(handle_title_keys_irq)     // F1 and SPACE now active
+;     draw_picture(title_picture, row=5, col=5)
+;     write "OCEAN SOFTWARE" at row 1, col 13  // green
+;     write "PRESENTS"       at row 3, col 13
+;     write "BY J.STEELE"    at row 21, col 25 // green
+;     repeat 17 times                          // color-cycle the picture, skipping black
+;         color = (get_title_color_for_increment() + 1) & COLOR_MASK  // 1..7, skipping black
+;         set_picture_color(color)
+;         wait(~0.33 s)
+;     repeat 16 times                          // hold the picture
+;         wait(~0.33 s)
+;     clear_screen()
+;     draw_high_scores()
+;     write "BONUS MAN AT 10000" at row 16, col 11  // red
+;     goto run_attract_intro
 ;
 ;
 ; ---- clear_screen
-; clear_screen()
 ;     fill screen with SPACE
 ;     fill color_map with WHITE
 ;     write "PRESS F1 FOR INSTRUCTIONS" at row 23, col 7
 ;     write "OR SPACE TO START"         at row 24, col 7
 ;
 ;
-; ---- title_screen
-; title_screen()
-;     sound_off()
-;     clear_screen()
-;     set_key_handler(irq_title_keys)     // F1 and SPACE now active
-;     draw_picture(title_picture, row=5, col=5)
-;     write "OCEAN SOFTWARE" at row 1, col 13  // green
-;     write "PRESENTS"       at row 3, col 13
-;     write "BY J.STEELE"    at row 21, col 25 // green
-;     repeat 17 times                          // color-cycle the picture, skipping black
-;         color = next_picture_color()       // steps 1-2-3-4-5-6-7-1-... (black skipped)
-;         set_picture_color(color)
-;         wait(~0.33 s)
-;     repeat 16 times                          // hold the picture
-;         wait(~0.33 s)
-;     clear_screen()
-;     draw_hiscores()
-;     write "BONUS MAN AT 10000" at row 16, col 11  // red
-;     goto attract_intro
-;
-;
-; ---- draw_hiscores
-; draw_hiscores()
+; ---- draw_high_scores
 ;     write "HISCORE"  at row 0,  col 16
 ;     write best_score at row 1,  col 16
 ;     write "LEAGUE"   at row 3,  col 9
@@ -1024,49 +1064,43 @@ clear_vars_loop:
 ;         write entry[e].initials at row (5 + e*2), col 27
 ;     // color bands: two-row stripes from row 3 downward
 ;     for each band b (0..5):
-;         paint rows (3 + b*2) and (3 + b*2 + 1) with band_color[b]
+;         paint rows (3 + b*2) and (3 + b*2 + 1) with tbl_hs_row_cols[5-b]
 ;
 ;
-; ---- color_cycle_x
-; next_picture_color() -> color
+; ---- get_title_color_for_increment -> color
 ;     color = current picture color
 ;     if color == YELLOW (7)
 ;         color = 0          // so caller's +1 gives 1, skipping black
 ;     return color
 ;
 ;
-; ---- attract_intro
-; attract_intro()
-;     play_intro_cinematic()          
-;     set_key_handler(irq_title_keys) // re-arm F1 / SPACE
+; ---- run_attract_intro
+;     play_intro_cinematic()
+;     set_key_handler(handle_title_keys_irq) // re-arm F1 / SPACE
 ;     goto intro_walk_right
 ;
 ;
-; ---- irq_title_keys
-; irq_title_keys()   // called on every timer tick
+; ---- handle_title_keys_irq
 ;     key = current_key()
 ;     if key == F1
-;         goto show_instructions      
+;         goto show_instructions
 ;     if key == SPACE
-;         goto title_start_game       
+;         goto exit_attract_mode_to_control_selection
 ;     run_normal_system_tick()
 ;
 ;
-; ---- title_start_game
-; title_start_game()
+; ---- exit_attract_mode_to_control_selection
 ;     hide_all_sprites()
 ;     restore_system_key_handler()
 ;     discard_interrupted_context()   // stack reset: abandon whatever was running
 ;     goto select_controls
 ;
 ;
-; ---- restore_kernal_irq
-; restore_system_key_handler()
+; ---- restore_system_key_handler
 ;     set_key_handler(system_default)
 ;
 ;
 ; ---- show_instructions
-; show_instructions()
 ;     hide_all_sprites()
 ;     restore_system_key_handler()
 ;     discard_interrupted_context()
@@ -1081,38 +1115,35 @@ clear_vars_loop:
 ;     draw bell icon at row 10, col 20  // 2x2 characters, grey
 ;     draw bell icon at row 16, col 12  // 2x2 characters, grey
 ;     write "JOYSTICK OR KEYBOARD CONTROLS HERO" at row 4, col 3
-;     set_key_handler(irq_title_keys)   // SPACE can still start the game
-;     // falls through into attract_delay
+;     set_key_handler(handle_title_keys_irq)   // SPACE can still start the game
+;     // falls through into wait_before_attract_restart
 ;
 ;
-; ---- attract_delay
-; attract_delay()   // also entered from flash_prompt
+; ---- wait_before_attract_restart
+; wait_before_attract_restart()   // also entered from flash_title_lettering
 ;     wait(~10 s)
-;     goto attract_restart
+;     goto restart_attract_mode
 ;
 ;
-; ---- sprites_off_restore_irq
-; hide_all_sprites()
+; ---- hide_all_sprites
 ;     hide_sprites()
 ;     goto restore_system_key_handler
 ;
 ;
-; ---- flash_prompt
-; flash_prompt()
+; ---- flash_title_lettering
 ;     repeat 64 times
-;         toggle color of title lettering (rows 9-10, 18 cols)  // flickers between two colors
+;         color = first_letter_color XOR LETTER_FLASH_BIT
+;         set all 36 letter cells to color (rows 9-10, 18 cols)
 ;         wait(~83 ms)
-;     goto attract_delay
+;     goto wait_before_attract_restart
 ;
 ;
-; ---- attract_restart
-; attract_restart()
+; ---- restart_attract_mode
 ;     hide_sprites()
-;     goto title_screen
+;     goto show_title_sequence
 ;
 ;
 ; ---- select_controls
-; select_controls()
 ;     clear_screen()
 ;     write "SELECT"    at row 3,  col 16
 ;     write "KEYBOARD"  at row 6,  col 16
@@ -1125,23 +1156,23 @@ clear_vars_loop:
 ;         write jump key hint        at row 18, col 11
 ;         write move-left key hint   at row 20, col 11
 ;         write move-right key hint  at row 22, col 11
-;         // falls through into game_start
+;         // falls through into start_new_game
 ;     else:
 ;         write "PLACE JOYSTICK IN PORT 2" at row 15, col 8
-;         goto game_start
+;         goto start_new_game
 ;
 ;
-; ---- game_start
-; game_start()
+; ---- start_new_game
 ;     wait(~7 s)
 ;     set_volume(MAX)
 ;     play_intro_cinematic()          // returns when hero has climbed the wall
 ;     screen    = 0                   // first screen
 ;     jump      = 0
 ;     player_x  = HERO_START_X
-;     facing    = 0
-;     bells     = 0
-;     score     = 0
-;     extra_life_given = false
+;     player_x_hi = 0
+;     clear bytes $0345..$0350        // facing, bells, score, extra-life flag, two unnamed bytes
+;     unused_0344 = HERO_START_X      // original writes retained; no explicit reads found
+;     unused_0342 = 1
+;     unused_0343 = $80
 ;     hide_sprites()
 ;     goto set_lives_start
